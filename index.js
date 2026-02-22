@@ -4,11 +4,9 @@
 
 import express from 'express';
 import Anthropic from '@anthropic-ai/sdk';
-import fs from 'fs/promises';
-import path from 'path';
 import twilio from 'twilio';
 import { sendSMS } from './twilio.js';
-import { registerUser } from './store.js';
+import { registerUser, getUserState, updateUserState } from './store.js';
 
 const app = express();
 app.set('trust proxy', true);
@@ -17,30 +15,10 @@ app.use(express.urlencoded({ extended: false })); // Twilio sends form-encoded w
 
 const PORT = process.env.PORT || 3000;
 const BASELINE_LIMIT = 30;
-const STATE_PATH = path.resolve('./data/runtime-state.json');
-const userState = new Map();
-let stateLoaded = false;
-let stateLoadPromise = null;
-let stateWriteChain = Promise.resolve();
 
 const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
-
-function getUserState(phone) {
-  if (!userState.has(phone)) {
-    userState.set(phone, {
-      baseline: [],
-      lastMessageDate: null,
-      threadOpen: false,
-    });
-  }
-  return userState.get(phone);
-}
-
-function getExistingUserState(phone) {
-  return userState.get(phone) ?? null;
-}
 
 function isSameDay(isoString, now = new Date()) {
   if (!isoString) return false;
@@ -51,48 +29,6 @@ function isSameDay(isoString, now = new Date()) {
     date.getDate() === now.getDate();
 }
 
-async function ensureStateLoaded() {
-  if (stateLoaded) return;
-  if (stateLoadPromise) {
-    await stateLoadPromise;
-    return;
-  }
-
-  stateLoadPromise = (async () => {
-    try {
-      const raw = await fs.readFile(STATE_PATH, 'utf8');
-      const parsed = JSON.parse(raw);
-      for (const [phone, value] of Object.entries(parsed)) {
-        userState.set(phone, {
-          baseline: Array.isArray(value?.baseline) ? value.baseline : [],
-          lastMessageDate: value?.lastMessageDate ?? null,
-          threadOpen: Boolean(value?.threadOpen),
-        });
-      }
-    } catch (err) {
-      if (err.code !== 'ENOENT') {
-        console.error('[Ember] Failed loading runtime state:', err);
-      }
-    } finally {
-      stateLoaded = true;
-    }
-  })();
-
-  await stateLoadPromise;
-}
-
-async function persistState() {
-  const snapshot = Object.fromEntries(userState);
-  stateWriteChain = stateWriteChain
-    .then(async () => {
-      await fs.mkdir(path.dirname(STATE_PATH), { recursive: true });
-      await fs.writeFile(STATE_PATH, JSON.stringify(snapshot, null, 2));
-    })
-    .catch((err) => {
-      console.error('[Ember] Failed persisting runtime state:', err);
-    });
-  await stateWriteChain;
-}
 
 function twilioValidationUrl(req) {
   if (process.env.TWILIO_INBOUND_URL) {
@@ -137,12 +73,11 @@ function detectTwoSigma(value, history) {
   if (!Number.isFinite(stddev)) return null;
 
   if (stddev === 0) {
-    const delta = value - mean;
-    if (Math.abs(delta) < 1e-9) return null;
+    if (value === mean) return null;
     return {
       mean,
       stddev,
-      zScore: delta > 0 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY,
+      zScore: Number.POSITIVE_INFINITY,
     };
   }
 
@@ -167,10 +102,11 @@ function toSentenceCase(text) {
 
 function normalizeRunPhrase(text) {
   const cleaned = (text ?? '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
   const words = cleaned.split(' ').filter(Boolean);
-  if (words.length < 2 || words.length > 4) return 'Cutting our run short?';
-  if (!cleaned.toLowerCase().includes('our run')) return 'Cutting our run short?';
-  return toSentenceCase(cleaned);
+  if (words.length > 4) return null;
+  if (!cleaned.toLowerCase().includes('our run')) return null;
+  return cleaned;
 }
 
 function normalizeAcknowledgment(text) {
@@ -185,24 +121,19 @@ function normalizeAcknowledgment(text) {
   return toSentenceCase(cleaned);
 }
 
-async function generateRunPhrase(styleTarget, severity) {
-  if (!anthropic) return styleTarget;
+async function generateRunPhrase(runAnomaly, runValue) {
+  if (!anthropic) return null;
 
   const context = {
-    routine: 'weekday run',
-    direction: 'below baseline',
-    constraint: '2-4 words',
-    shared_language: 'our run',
-    no_advice: true,
-    no_interpretation: true,
-    severity,
-    style_target: styleTarget,
+    mean: runAnomaly.mean,
+    value: runValue,
+    zScore: runAnomaly.zScore,
   };
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: 30,
-    system: 'You produce SMS phrasing only. Output 2-4 words in sentence case. No advice. No interpretation. Use "our run". If severity is sharp_drop, stay close to the style target. Return only the phrase.',
+    system: 'Generate a short observational SMS phrase. Constraints: 2-4 words, no advice, no interpretation, include possessive "our run", return only the phrase.',
     messages: [{
       role: 'user',
       content: `Structured context:\n${JSON.stringify(context, null, 2)}`,
@@ -260,11 +191,13 @@ app.post('/sync', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'phone required' });
 
   try {
-    await ensureStateLoaded();
     const state = getUserState(phone);
     const alreadyMessagedToday = isSameDay(state.lastMessageDate);
     const sleepHistory = state.baseline
       .map(item => item.sleep_duration_hours)
+      .filter(value => Number.isFinite(value));
+    const wakeHistory = state.baseline
+      .map(item => item.wake_time_hour)
       .filter(value => Number.isFinite(value));
     const runHistory = state.baseline
       .map(item => item.running_minutes)
@@ -289,16 +222,32 @@ app.post('/sync', async (req, res) => {
     }
 
     if (!message) {
+      const wakeAnomaly = detectTwoSigma(snapshot.wake_time_hour, wakeHistory);
+      if (wakeAnomaly) {
+        if (snapshot.wake_time_hour < wakeAnomaly.mean) {
+          message = 'Up early?';
+        } else if (snapshot.wake_time_hour > wakeAnomaly.mean) {
+          message = 'Up late?';
+        }
+        if (message) {
+          anomaly = {
+            type: 'wake_time_hour',
+            zScore: wakeAnomaly.zScore,
+          };
+        }
+      }
+    }
+
+    if (!message) {
       const runAnomaly = detectTwoSigma(snapshot.running_minutes, runHistory);
       if (runAnomaly && snapshot.running_minutes < runAnomaly.mean) {
-        const severeDrop = runAnomaly.mean > 0 && snapshot.running_minutes <= runAnomaly.mean * 0.5;
-        const styleTarget = severeDrop ? 'Cutting our run short?' : 'Our run today?';
-        const severity = severeDrop ? 'sharp_drop' : 'below_baseline';
-        message = await generateRunPhrase(styleTarget, severity);
-        anomaly = {
-          type: 'running_minutes',
-          zScore: runAnomaly.zScore,
-        };
+        message = await generateRunPhrase(runAnomaly, snapshot.running_minutes);
+        if (message) {
+          anomaly = {
+            type: 'running_minutes',
+            zScore: runAnomaly.zScore,
+          };
+        }
       }
     }
 
@@ -313,12 +262,13 @@ app.post('/sync', async (req, res) => {
 
     state.baseline.push({
       sleep_duration_hours: snapshot.sleep_duration_hours,
+      wake_time_hour: snapshot.wake_time_hour,
       running_minutes: snapshot.running_minutes,
     });
     if (state.baseline.length > BASELINE_LIMIT) {
       state.baseline.shift();
     }
-    await persistState();
+    updateUserState(phone, state);
 
     res.json({ ok: true, anomaly: anomaly ?? null });
   } catch (err) {
@@ -336,11 +286,18 @@ app.post('/sync', async (req, res) => {
  *   URL: https://your-ember-server.com/sms/inbound
  */
 app.post('/sms/inbound', async (req, res) => {
-//Temporily disable signature validation 
-//  if (!isValidTwilioSignature(req)) {
-//    console.warn('[Ember] Rejected inbound SMS: invalid Twilio signature');
-//    return res.status(403).send('forbidden');
-//  }
+  const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+  const isValid = twilio.validateRequest(
+    process.env.TWILIO_AUTH_TOKEN,
+    req.headers['x-twilio-signature'],
+    url,
+    req.body
+  );
+
+  if (!isValid) {
+    console.warn('[Ember] Rejected inbound SMS: invalid Twilio signature');
+    return res.status(403).send('forbidden');
+  }
 
   const from = req.body.From;   // User's phone number, E.164
   const body = (req.body.Body ?? '').trim();
@@ -354,9 +311,7 @@ app.post('/sms/inbound', async (req, res) => {
 
   if (!from || !body) return;
 
-  await ensureStateLoaded();
-  const state = getExistingUserState(from);
-  if (!state) return;
+  const state = getUserState(from);
   if (!state.threadOpen) return;
 
   try {
@@ -367,7 +322,7 @@ app.post('/sms/inbound', async (req, res) => {
     console.error('[Ember] Inbound SMS error:', err);
   } finally {
     state.threadOpen = false;
-    await persistState();
+    updateUserState(from, state);
   }
 });
 
