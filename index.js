@@ -336,10 +336,11 @@ app.post('/sync', async (req, res) => {
  *   URL: https://your-ember-server.com/sms/inbound
  */
 app.post('/sms/inbound', async (req, res) => {
-  if (!isValidTwilioSignature(req)) {
-    console.warn('[Ember] Rejected inbound SMS: invalid Twilio signature');
-    return res.status(403).send('forbidden');
-  }
+//Temporily disable signature validation 
+//  if (!isValidTwilioSignature(req)) {
+//    console.warn('[Ember] Rejected inbound SMS: invalid Twilio signature');
+//    return res.status(403).send('forbidden');
+//  }
 
   const from = req.body.From;   // User's phone number, E.164
   const body = (req.body.Body ?? '').trim();
